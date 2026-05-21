@@ -412,26 +412,35 @@ For first-time setup, the container image ships with a bootstrap entrypoint that
 
 1. Generate a fresh WireGuard private key and derive the matching public key.
 2. Write `${CONFIG_DIR}/config.yaml` with the private key, an SCM block (with `allowCodeAccess: true`), and a broad allowlist for the SCM host.
-3. Write the public key to `${CONFIG_DIR}/pubkey.txt` and print it to stderr.
+3. If `SEMGREP_APP_TOKEN` is set, POST the public key to `https://semgrep.dev/api/broker/<deployment_id>/config` so registration is fully automatic. The deployment id is parsed from the broker's `-d` / `--deployment-id` flag. Otherwise, print a banner with manual-registration instructions to `docker logs`.
 4. Exec the broker with the args you passed.
 
 ```bash
-mkdir -p /opt/semgrep-broker
-chown "$(id -u)" /opt/semgrep-broker   # the container user must be able to write here
-
 docker run -d --name semgrep-network-broker \
   --restart=always \
   --cap-add NET_ADMIN \
-  -v /opt/semgrep-broker:/emt \
+  -v semgrep-broker:/emt \
   -e SCM_TYPE=gitlab \
   -e SCM_BASE_URL=https://gitlab.example.com \
+  -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
   ghcr.io/semgrep/semgrep-network-broker:latest \
   -c /emt/config.yaml \
-  -d 12345 \
-&& sleep 1 && docker logs semgrep-network-broker
+  -d 12345
 ```
 
-The trailing `docker logs` surfaces the bootstrap banner — including the public key and a link to register it — directly in your terminal right after the container detaches. The same banner is preserved in `docker logs` and the public key is also written to `/opt/semgrep-broker/pubkey.txt` (which doubles as a how-to: `cat` it for the full registration instructions).
+The deployment id only needs to be passed once — bootstrap reads it from the broker's `-d` / `--deployment-id` flag for the auto-registration call.
+
+`-v semgrep-broker:/emt` is a docker-managed named volume — no host directory or permission setup needed. The image pre-creates `/emt` owned by the runtime user, so the volume inherits the right ownership on first mount.
+
+If you'd rather mount a host directory (e.g., to inspect `config.yaml` directly), use a bind mount instead — but you'll need to create it with the right ownership first:
+
+```bash
+mkdir -p /opt/semgrep-broker
+chown "$(id -u)" /opt/semgrep-broker   # only required for bind mounts
+# then swap the -v above for: -v /opt/semgrep-broker:/emt
+```
+
+To view the bootstrap banner (e.g., to confirm auto-registration succeeded or to grab the pubkey if it didn't): `docker logs semgrep-network-broker`.
 
 `SCM_TYPE` accepts `github`, `gitlab`, `bitbucket`, or `azuredevops`. **Pass only the host base URL** (e.g., `https://gitlab.example.com`) — the bootstrap appends the right API path for the chosen SCM:
 
@@ -444,19 +453,19 @@ The trailing `docker logs` surfaces the bootstrap banner — including the publi
 
 The generated config starts broad — any path under your SCM host is allowed for GET/POST/PUT/PATCH/DELETE — so you can validate end-to-end connectivity first. Once it works, tighten by replacing the `allowlist:` block with specific URL patterns (see the SCM-specific allowlist sections above).
 
-After the container starts, grab the public key and register it with Semgrep:
+If auto-registration didn't run (no `SEMGREP_APP_TOKEN`, no `-d` flag, or the API call failed), grab the public key from the banner in `docker logs` and register it with Semgrep manually:
 
 ```bash
-docker logs semgrep-network-broker 2>&1 | sed -n '/register this public key/,/Saved to:/p'
-# or
-cat /opt/semgrep-broker/pubkey.txt
+docker logs semgrep-network-broker
 ```
 
 **Notes:**
 
-- **Registration can happen after startup.** The broker starts immediately; heartbeats retry on a 60s interval and fail (`heartbeat.failure` in logs) until you register the public key with Semgrep. Once registered, the next heartbeat succeeds and the broker logs `Established connectivity with Semgrep` — no restart needed.
-- **Bootstrap is idempotent.** If `/emt/config.yaml` already exists, the script skips key generation and just starts the broker with the existing config. This means restarts under `--restart=always` reuse the same keypair, so the registered public key remains valid. To rotate keys, delete `/emt/config.yaml` before restarting.
+- **Auto-registration is best-effort.** If the `POST /api/broker/<deployment_id>/config` call fails (bad token, network blip, etc.) the bootstrap logs the HTTP status + response body, falls back to printing the manual-registration banner, and starts the broker anyway. You can complete registration by hand from the banner.
+- **Registration can happen after startup.** The broker starts immediately; heartbeats retry on a 60s interval and fail (`heartbeat.failure` in logs) until the public key is registered with Semgrep. Once registered, the next heartbeat succeeds and the broker logs `Established connectivity with Semgrep` — no restart needed.
+- **Bootstrap is idempotent.** If `/emt/config.yaml` already exists, the script skips key generation, skips auto-registration, and just starts the broker with the existing config. This means restarts under `--restart=always` reuse the same keypair, so the registered public key remains valid. To rotate keys, delete `/emt/config.yaml` before restarting.
 - The bootstrap script only runs when `SCM_TYPE` is set, so `genkey`, `pubkey`, `relay`, `dump`, and ordinary `-c ... -d ...` invocations continue to work unchanged.
+- `SEMGREP_HOSTNAME` overrides the API host (default `semgrep.dev`) if you need to point at a non-default Semgrep environment.
 
 ## Other Commands
 

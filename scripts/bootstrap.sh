@@ -2,8 +2,10 @@
 # Bootstrap entrypoint for semgrep-network-broker.
 #
 # When SCM_TYPE is set, this script regenerates a WireGuard keypair, writes a
-# minimal config.yaml + pubkey.txt to ${CONFIG_DIR}, prints the public key for
-# registration with Semgrep, then execs the broker with the passed args.
+# minimal config.yaml to ${CONFIG_DIR}, then execs the broker. If
+# SEMGREP_APP_TOKEN is set AND the broker is invoked with -d / --deployment-id
+# (parsed from "$@"), the pubkey is auto-registered against the Semgrep API.
+# Otherwise a manual-registration banner is printed to `docker logs`.
 #
 # When SCM_TYPE is unset, the script is a pass-through to the broker binary —
 # preserving the original ENTRYPOINT behavior for genkey/pubkey/relay/dump and
@@ -14,7 +16,7 @@ set -eu
 BROKER_BIN="${BROKER_BIN:-/usr/bin/semgrep-network-broker}"
 CONFIG_DIR="${CONFIG_DIR:-/emt}"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-PUBKEY_FILE="${CONFIG_DIR}/pubkey.txt"
+SEMGREP_HOSTNAME="${SEMGREP_HOSTNAME:-semgrep.dev}"
 
 if [ -n "${SCM_TYPE:-}" ]; then
     if [ -z "${SCM_BASE_URL:-}" ]; then
@@ -75,43 +77,96 @@ inbound:
       methods: [GET, POST, PUT, PATCH, DELETE]
 YAML
 
-        cat > "${PUBKEY_FILE}" <<PUBKEY
-# Semgrep Network Broker — public key registration
-#
-# 1. Open https://semgrep.dev and go to your org's Network Broker settings.
-# 2. Paste the public key below into the registration form.
-# 3. The broker will start picking up heartbeats within ~60s of registration —
-#    no container restart needed.
-#
-# Generated: $(date -u +%FT%TZ)
+        # Parse the deployment id from the broker's -d / --deployment-id flag
+        # so users don't have to pass the same number twice (once for the
+        # broker, once for the registration call).
+        DEPLOYMENT_ID=""
+        NEXT_IS_DID=0
+        for arg in "$@"; do
+            if [ "${NEXT_IS_DID}" -eq 1 ]; then
+                DEPLOYMENT_ID="${arg}"
+                break
+            fi
+            case "${arg}" in
+                -d|--deployment-id)  NEXT_IS_DID=1 ;;
+                -d=*)                DEPLOYMENT_ID="${arg#-d=}"; break ;;
+                --deployment-id=*)   DEPLOYMENT_ID="${arg#--deployment-id=}"; break ;;
+            esac
+        done
 
-${PUBLIC_KEY}
-PUBKEY
+        # Auto-register the pubkey with Semgrep if a token + deployment id are
+        # available. On any failure we fall through to the manual banner; the
+        # broker still starts so registration can be completed by hand.
+        REGISTERED=0
+        if [ -n "${SEMGREP_APP_TOKEN:-}" ] && [ -n "${DEPLOYMENT_ID}" ]; then
+            REG_URL="https://${SEMGREP_HOSTNAME}/api/broker/${DEPLOYMENT_ID}/config"
+            REG_BODY="$(printf '{"public_key":"%s"}' "${PUBLIC_KEY}")"
+            # curl prints '000' for http_code on connection failure and exits
+            # non-zero. `|| true` keeps `set -e` happy; the empty-string guard
+            # below catches any other unexpected output.
+            REG_HTTP_CODE="$(curl -sS -o /tmp/bootstrap_reg.out -w '%{http_code}' \
+                -X POST "${REG_URL}" \
+                -H "Authorization: Bearer ${SEMGREP_APP_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "${REG_BODY}" || true)"
+            case "${REG_HTTP_CODE}" in
+                ''|*[!0-9]*) REG_HTTP_CODE="000" ;;
+            esac
+            if [ "${REG_HTTP_CODE}" -ge 200 ] && [ "${REG_HTTP_CODE}" -lt 300 ]; then
+                REGISTERED=1
+            else
+                REG_ERR_BODY="$(cat /tmp/bootstrap_reg.out 2>/dev/null || true)"
+                echo "bootstrap: auto-registration to ${REG_URL} failed (HTTP ${REG_HTTP_CODE}). Falling back to manual instructions." >&2
+                if [ -n "${REG_ERR_BODY}" ]; then
+                    echo "bootstrap: response body: ${REG_ERR_BODY}" >&2
+                fi
+            fi
+            rm -f /tmp/bootstrap_reg.out
+        fi
 
-        BANNER_TEXT="
+        if [ "${REGISTERED}" -eq 1 ]; then
+            BANNER_TEXT="
 ================================================================================
-  Semgrep Network Broker — REGISTER THIS PUBLIC KEY at https://semgrep.dev
+  Semgrep Network Broker — public key auto-registered with Semgrep
+--------------------------------------------------------------------------------
+  Deployment:     ${DEPLOYMENT_ID}
+  Public key:     ${PUBLIC_KEY}
+  Config:         ${CONFIG_FILE}
+
+  No further action needed. Within ~60s logs should show
+  'Established connectivity with Semgrep'.
+
+  Bootstrap will NOT regenerate keys on subsequent container starts as long as
+  ${CONFIG_FILE} exists. Delete that file if you ever need to rotate.
+================================================================================
+"
+        else
+            BANNER_TEXT="
+================================================================================
+  Semgrep Network Broker — REGISTER THIS PUBLIC KEY at https://${SEMGREP_HOSTNAME}
 --------------------------------------------------------------------------------
   ${PUBLIC_KEY}
 --------------------------------------------------------------------------------
-  Also saved to:  ${PUBKEY_FILE}
   Config:         ${CONFIG_FILE}
 
   Steps:
-    1. Open https://semgrep.dev and navigate to your org's Network Broker
+    1. Open https://${SEMGREP_HOSTNAME} and navigate to your org's Network Broker
        settings (under SCM / integrations).
     2. Paste the public key above into the registration form.
     3. The broker is already running and retrying heartbeats. Within ~60s of
        registration, logs will show 'Established connectivity with Semgrep' —
        no restart needed.
 
+  Tip: set SEMGREP_APP_TOKEN to skip this step on future first-time runs —
+  the pubkey will be POSTed to Semgrep automatically.
+
   To re-display this banner later:  docker logs <container-name>
-  Or just read the file:            cat ${PUBKEY_FILE}
 
   Bootstrap will NOT regenerate keys on subsequent container starts as long as
   ${CONFIG_FILE} exists. Delete that file if you ever need to rotate.
 ================================================================================
 "
+        fi
         # Print to both streams so it surfaces regardless of how the container
         # is launched (detached, attached, captured to a logger, etc.).
         printf '%s\n' "${BANNER_TEXT}" >&2
