@@ -406,6 +406,58 @@ Requirements:
 
 - internet access to `wireguard.semgrep.dev` on UDP port 51820
 
+### One-shot Docker bootstrap
+
+For first-time setup, the container image ships with a bootstrap entrypoint that can generate a WireGuard keypair and write a minimal config in one command. Set `SCM_TYPE` and `SCM_BASE_URL` as env vars and the broker will:
+
+1. Generate a fresh WireGuard private key and derive the matching public key.
+2. Write `${CONFIG_DIR}/config.yaml` with the private key, an SCM block (with `allowCodeAccess: true`), and a broad allowlist for the SCM host.
+3. Write the public key to `${CONFIG_DIR}/pubkey.txt` and print it to stderr.
+4. Exec the broker with the args you passed.
+
+```bash
+mkdir -p /opt/semgrep-broker
+chown "$(id -u)" /opt/semgrep-broker   # the container user must be able to write here
+
+docker run -d --name semgrep-network-broker \
+  --restart=always \
+  --cap-add NET_ADMIN \
+  -v /opt/semgrep-broker:/emt \
+  -e SCM_TYPE=gitlab \
+  -e SCM_BASE_URL=https://gitlab.example.com \
+  ghcr.io/semgrep/semgrep-network-broker:latest \
+  -c /emt/config.yaml \
+  -d 12345 \
+&& sleep 1 && docker logs semgrep-network-broker
+```
+
+The trailing `docker logs` surfaces the bootstrap banner — including the public key and a link to register it — directly in your terminal right after the container detaches. The same banner is preserved in `docker logs` and the public key is also written to `/opt/semgrep-broker/pubkey.txt` (which doubles as a how-to: `cat` it for the full registration instructions).
+
+`SCM_TYPE` accepts `github`, `gitlab`, `bitbucket`, or `azuredevops`. **Pass only the host base URL** (e.g., `https://gitlab.example.com`) — the bootstrap appends the right API path for the chosen SCM:
+
+| `SCM_TYPE`    | Appended to `SCM_BASE_URL` for the SCM block's `baseUrl` |
+| ------------- | -------------------------------------------------------- |
+| `github`      | `/api/v3`                                                |
+| `gitlab`      | `/api/v4`                                                |
+| `bitbucket`   | `/rest/api/latest`                                       |
+| `azuredevops` | _(none — pass the full URL including any org/namespace)_ |
+
+The generated config starts broad — any path under your SCM host is allowed for GET/POST/PUT/PATCH/DELETE — so you can validate end-to-end connectivity first. Once it works, tighten by replacing the `allowlist:` block with specific URL patterns (see the SCM-specific allowlist sections above).
+
+After the container starts, grab the public key and register it with Semgrep:
+
+```bash
+docker logs semgrep-network-broker 2>&1 | sed -n '/register this public key/,/Saved to:/p'
+# or
+cat /opt/semgrep-broker/pubkey.txt
+```
+
+**Notes:**
+
+- **Registration can happen after startup.** The broker starts immediately; heartbeats retry on a 60s interval and fail (`heartbeat.failure` in logs) until you register the public key with Semgrep. Once registered, the next heartbeat succeeds and the broker logs `Established connectivity with Semgrep` — no restart needed.
+- **Bootstrap is idempotent.** If `/emt/config.yaml` already exists, the script skips key generation and just starts the broker with the existing config. This means restarts under `--restart=always` reuse the same keypair, so the registered public key remains valid. To rotate keys, delete `/emt/config.yaml` before restarting.
+- The bootstrap script only runs when `SCM_TYPE` is set, so `genkey`, `pubkey`, `relay`, `dump`, and ordinary `-c ... -d ...` invocations continue to work unchanged.
+
 ## Other Commands
 
 ### dump

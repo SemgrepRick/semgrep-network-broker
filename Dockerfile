@@ -18,9 +18,12 @@ RUN go build -o /semgrep-network-broker -ldflags="-X 'github.com/semgrep/semgrep
 FROM alpine:3.23
 
 RUN adduser -D semgrep
+
+COPY --from=build /semgrep-network-broker /usr/bin/semgrep-network-broker
+COPY scripts/bootstrap.sh /usr/local/bin/bootstrap.sh
+RUN chmod +x /usr/local/bin/bootstrap.sh
+
 USER semgrep
 WORKDIR /home/semgrep
 
-COPY --from=build /semgrep-network-broker /usr/bin/semgrep-network-broker
-
-ENTRYPOINT ["/usr/bin/semgrep-network-broker"]
+ENTRYPOINT ["/usr/local/bin/bootstrap.sh"]
