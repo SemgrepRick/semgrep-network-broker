@@ -24,10 +24,11 @@ COPY --from=build /semgrep-network-broker /usr/bin/semgrep-network-broker
 COPY scripts/bootstrap.sh /usr/local/bin/bootstrap.sh
 RUN chmod +x /usr/local/bin/bootstrap.sh
 
-# Pre-create the bootstrap config dir owned by the runtime user so that a
-# docker-managed named volume (or no mount at all) is writable out of the box.
-# Bind mounts still need host-side chown — see README.
-RUN mkdir -p /emt && chown semgrep:semgrep /emt
+# Pre-create the bootstrap config dir owned by the runtime user. This lives in
+# the container's writable layer (not a mounted volume), so the generated
+# config.yaml and WireGuard keypair persist across `docker restart` / host
+# reboots with --restart=always, but a fresh `docker run` starts clean.
+RUN mkdir -p /var/lib/semgrep-network-broker && chown semgrep:semgrep /var/lib/semgrep-network-broker
 
 USER semgrep
 WORKDIR /home/semgrep

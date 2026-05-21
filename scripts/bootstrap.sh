@@ -9,6 +9,11 @@
 # network blip, etc.) the broker still starts and a manual-registration
 # banner is printed to `docker logs`.
 #
+# Config persistence is tied to the container, not a mounted volume:
+# ${CONFIG_DIR} lives in the container's writable layer, so config.yaml
+# survives `docker restart` / host reboots under --restart=always, but a fresh
+# `docker run` regenerates the keypair and re-registers with Semgrep.
+#
 # When SCM_TYPE is unset, the script is a pass-through to the broker binary —
 # preserving the original ENTRYPOINT behavior for genkey/pubkey/relay/dump and
 # normal `-c ... -d ...` invocations.
@@ -16,7 +21,7 @@
 set -eu
 
 BROKER_BIN="${BROKER_BIN:-/usr/bin/semgrep-network-broker}"
-CONFIG_DIR="${CONFIG_DIR:-/emt}"
+CONFIG_DIR="${CONFIG_DIR:-/var/lib/semgrep-network-broker}"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SEMGREP_HOSTNAME="${SEMGREP_HOSTNAME:-semgrep.dev}"
 
@@ -48,7 +53,7 @@ if [ -n "${SCM_TYPE:-}" ]; then
     esac
 
     if [ ! -d "${CONFIG_DIR}" ]; then
-        echo "bootstrap: ${CONFIG_DIR} does not exist — mount your config directory, e.g. -v /opt/semgrep-broker:${CONFIG_DIR}" >&2
+        echo "bootstrap: ${CONFIG_DIR} does not exist — the image pre-creates it; set CONFIG_DIR or mount a writable directory if you're overriding the default" >&2
         exit 1
     fi
 
@@ -64,8 +69,37 @@ if [ -n "${SCM_TYPE:-}" ]; then
         azuredevops) API_URL="${BASE_URL}" ;; # Azure DevOps URL shape varies; pass through as-is.
     esac
 
+    # Resolve the deployment id on every invocation (not just first boot) — the
+    # broker needs `-d <id>` whether or not bootstrap is generating a new config,
+    # and we may need to inject it into the exec line below. CLI flag wins; env
+    # var is the fallback so users can configure it alongside the other -e vars.
+    DEPLOYMENT_ID=""
+    DEPLOYMENT_ID_FROM_ARGS=0
+    NEXT_IS_DID=0
+    for arg in "$@"; do
+        if [ "${NEXT_IS_DID}" -eq 1 ]; then
+            DEPLOYMENT_ID="${arg}"
+            DEPLOYMENT_ID_FROM_ARGS=1
+            break
+        fi
+        case "${arg}" in
+            -d|--deployment-id)  NEXT_IS_DID=1 ;;
+            -d=*)                DEPLOYMENT_ID="${arg#-d=}"; DEPLOYMENT_ID_FROM_ARGS=1; break ;;
+            --deployment-id=*)   DEPLOYMENT_ID="${arg#--deployment-id=}"; DEPLOYMENT_ID_FROM_ARGS=1; break ;;
+        esac
+    done
+
+    if [ -z "${DEPLOYMENT_ID}" ] && [ -n "${SEMGREP_DEPLOYMENT_ID:-}" ]; then
+        DEPLOYMENT_ID="${SEMGREP_DEPLOYMENT_ID}"
+    fi
+
+    if [ -z "${DEPLOYMENT_ID}" ]; then
+        echo "bootstrap: deployment id is required — set SEMGREP_DEPLOYMENT_ID or pass -d <id> after the image name" >&2
+        exit 1
+    fi
+
     if [ -f "${CONFIG_FILE}" ]; then
-        echo "bootstrap: ${CONFIG_FILE} already exists — reusing it. Delete the file to force regeneration." >&2
+        echo "bootstrap: ${CONFIG_FILE} already exists — reusing it. (Config persists across 'docker restart' for this container; a fresh 'docker run' would regenerate.)" >&2
     else
         if [ ! -w "${CONFIG_DIR}" ]; then
             echo "bootstrap: ${CONFIG_DIR} is not writable by UID $(id -u). chown the host directory to that UID, or run the container with --user." >&2
@@ -74,32 +108,10 @@ if [ -n "${SCM_TYPE:-}" ]; then
 
         # Validate first-boot prerequisites BEFORE generating a key or writing
         # config.yaml — otherwise a failed validation would leave a stale,
-        # unregistered key on the volume and the idempotency check on the next
-        # run would silently reuse it.
+        # unregistered key in the container layer that the idempotency check
+        # would silently reuse on the next `docker restart`.
         if [ -z "${SEMGREP_APP_TOKEN:-}" ]; then
             echo "bootstrap: SEMGREP_APP_TOKEN must be set on first boot so the pubkey can be auto-registered with Semgrep" >&2
-            exit 1
-        fi
-
-        # Parse the deployment id from the broker's -d / --deployment-id flag
-        # so users don't have to pass the same number twice (once for the
-        # broker, once for the registration call).
-        DEPLOYMENT_ID=""
-        NEXT_IS_DID=0
-        for arg in "$@"; do
-            if [ "${NEXT_IS_DID}" -eq 1 ]; then
-                DEPLOYMENT_ID="${arg}"
-                break
-            fi
-            case "${arg}" in
-                -d|--deployment-id)  NEXT_IS_DID=1 ;;
-                -d=*)                DEPLOYMENT_ID="${arg#-d=}"; break ;;
-                --deployment-id=*)   DEPLOYMENT_ID="${arg#--deployment-id=}"; break ;;
-            esac
-        done
-
-        if [ -z "${DEPLOYMENT_ID}" ]; then
-            echo "bootstrap: -d / --deployment-id must be passed to the broker so the pubkey can be auto-registered with Semgrep" >&2
             exit 1
         fi
 
@@ -188,8 +200,9 @@ YAML
   No further action needed. Within ~60s logs should show
   'Established connectivity with Semgrep'.
 
-  Bootstrap will NOT regenerate keys on subsequent container starts as long as
-  ${CONFIG_FILE} exists. Delete that file if you ever need to rotate.
+  Config persists across 'docker restart' / host reboots for this container.
+  A fresh 'docker run' will generate a new keypair and re-register with
+  Semgrep automatically.
 ================================================================================
 "
         else
@@ -214,8 +227,9 @@ YAML
 
   To re-display this banner later:  docker logs <container-name>
 
-  Bootstrap will NOT regenerate keys on subsequent container starts as long as
-  ${CONFIG_FILE} exists. Delete that file if you ever need to rotate.
+  Config persists across 'docker restart' / host reboots for this container.
+  A fresh 'docker run' will generate a new keypair and re-register with
+  Semgrep automatically.
 ================================================================================
 "
         fi
@@ -224,6 +238,19 @@ YAML
         printf '%s\n' "${BANNER_TEXT}" >&2
         printf '%s\n' "${BANNER_TEXT}"
     fi
+
+    # Bootstrap wrote (or reused) ${CONFIG_FILE}, so inject `-c ${CONFIG_FILE}`
+    # automatically — the user doesn't need to repeat the path on the docker
+    # command line. Any additional `-c` flags the user passes are appended and
+    # overlaid on top (maps merge, arrays replace; see README).
+    #
+    # If the deployment id came from SEMGREP_DEPLOYMENT_ID (env), inject `-d`
+    # too so the broker sees it. If it came from `-d` on the CLI it's already
+    # in "$@".
+    if [ "${DEPLOYMENT_ID_FROM_ARGS:-0}" -eq 0 ] && [ -n "${DEPLOYMENT_ID:-}" ]; then
+        exec "${BROKER_BIN}" -c "${CONFIG_FILE}" -d "${DEPLOYMENT_ID}" "$@"
+    fi
+    exec "${BROKER_BIN}" -c "${CONFIG_FILE}" "$@"
 fi
 
 exec "${BROKER_BIN}" "$@"
