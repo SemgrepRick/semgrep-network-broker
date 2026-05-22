@@ -25,7 +25,7 @@ docker run -d --name semgrep-network-broker \
   -e SCM_ALLOW_CODE_ACCESS=true \
   -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
   -e SEMGREP_DEPLOYMENT_ID=12345 \
-  ghcr.io/semgrep/semgrep-network-broker:latest
+  ghcr.io/semgreprick/semgrep-network-broker:latest
 ```
 
 What bootstrap does on a fresh `docker run`:
@@ -110,7 +110,7 @@ docker run -d --name semgrep-network-broker \
   -e SCM_CONFIG_FILE=/etc/broker-config.yaml \
   -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
   -e SEMGREP_DEPLOYMENT_ID=12345 \
-  ghcr.io/semgrep/semgrep-network-broker:latest
+  ghcr.io/semgreprick/semgrep-network-broker:latest
 ```
 
 **Multi-SCM** — one broker, GitLab + GitHub Enterprise, curated allowlists auto-populated:
@@ -134,7 +134,7 @@ docker run -d --name semgrep-network-broker \
   -e SCM_CONFIG_FILE=/etc/broker-config.yaml \
   -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
   -e SEMGREP_DEPLOYMENT_ID=12345 \
-  ghcr.io/semgrep/semgrep-network-broker:latest
+  ghcr.io/semgreprick/semgrep-network-broker:latest
 ```
 
 The file must exist inside the container, be readable by the runtime user, and be non-empty — an empty file is rejected to avoid silently starting the broker with no overlay. Bootstrap validates it on **every** invocation (not just first boot), so updates to the bind-mounted file take effect on the next `docker restart`. To change settings without restarting the container, you can also pass extra `-c <path>` flags after the image name — they layer on top of bootstrap's auto-injected `-c` flags.
@@ -158,7 +158,7 @@ docker run -d --name semgrep-network-broker \
     -e SCM_CONFIG_FILE=/etc/broker-config.yaml \                       # optional**   — broker config snippet layered as a second -c at exec time; bind-mount from the host
     -e SEMGREP_HOSTNAME=semgrep.dev \                                  # optional     — override Semgrep API host (default: semgrep.dev)
     -e CONFIG_DIR=/var/lib/semgrep-network-broker \                    # optional     — where bootstrap writes config.yaml (default)
-    ghcr.io/semgrep/semgrep-network-broker:latest
+    ghcr.io/semgreprick/semgrep-network-broker:latest
 
 # Auto-injected by bootstrap when it execs the broker:
 #   -c ${CONFIG_DIR}/config.yaml          (the bootstrap-generated config)
