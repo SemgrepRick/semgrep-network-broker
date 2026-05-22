@@ -85,7 +85,7 @@ $ docker run \
   -v /path/containing/your/certs:/certs \ # mount a path from the host machine as a container volume
   -e SSL_CERT_DIR=/certs \ # set the $SSL_CERT_DIR environment variable to the mounted volume
   ...
-  -it semgrep-network-broker:latest -c /emt/config.yaml
+  -it semgrep-network-broker:latest -c /var/lib/semgrep-network-broker/config.yaml
 ```
 
 Refer to the [network broker docs on semgrep.dev](https://semgrep.dev/docs/semgrep-ci/network-broker) for more detail on docker setup.
@@ -405,6 +405,162 @@ Multiple config files can be overlaid on top of each other by passing multiple `
 Requirements:
 
 - internet access to `wireguard.semgrep.dev` on UDP port 51820
+
+### One-shot Docker bootstrap
+
+For first-time setup, the container image ships with a bootstrap entrypoint that can generate a WireGuard keypair, write a minimal config, and register the public key with Semgrep in one command. Set `SCM_TYPE`, `SCM_BASE_URL`, `SCM_ALLOW_CODE_ACCESS`, and `SEMGREP_APP_TOKEN` as env vars, pass the broker's `-d <deployment_id>`, and the bootstrap will:
+
+1. Generate a fresh WireGuard private key and derive the matching public key.
+2. Write `${CONFIG_DIR}/config.yaml` with the private key, an SCM block (with `allowCodeAccess` set from `SCM_ALLOW_CODE_ACCESS`), and a broad allowlist for the SCM host.
+3. POST the public key to `https://semgrep.dev/api/broker/<deployment_id>/config` to auto-register it. The deployment id is parsed from the broker's `-d` / `--deployment-id` flag. If the HTTP call fails (bad token, network blip, etc.), bootstrap logs the failure, prints a manual-registration banner, and starts the broker anyway so you can complete registration by hand.
+4. Exec the broker with the args you passed.
+
+```bash
+docker run -d --name semgrep-network-broker \
+  --restart=always \
+  --cap-add NET_ADMIN \
+  -e SCM_TYPE=gitlab \
+  -e SCM_BASE_URL=https://gitlab.example.com \
+  -e SCM_ALLOW_CODE_ACCESS=true \
+  -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
+  -e SEMGREP_DEPLOYMENT_ID=12345 \
+  ghcr.io/semgrep/semgrep-network-broker:latest
+```
+
+Bootstrap auto-injects `-c <generated-config>` and `-d <deployment-id>` when it execs the broker, so you don't need to pass them on the docker command line. If you'd rather use the CLI flag for the deployment id (e.g., to override the env var), append `-d <id>` after the image name and bootstrap will use that instead.
+
+**Config persistence model.** The bootstrap writes `config.yaml` into the container's writable layer (default: `/var/lib/semgrep-network-broker/`), not a mounted volume. That means:
+
+- `docker restart semgrep-network-broker`, host reboots under `--restart=always`, and Docker-initiated restarts after a crash all reuse the same keypair — no re-registration.
+- A fresh `docker run` (after `docker rm`, or with a new container name) starts clean: a new keypair is generated and auto-registered with Semgrep.
+
+If you'd rather inspect `config.yaml` from the host or share it across container recreations, mount a volume over the config dir (e.g., `-v /opt/semgrep-broker:/var/lib/semgrep-network-broker`) — bind mounts will need `chown "$(id -u)" /opt/semgrep-broker` first.
+
+To view the bootstrap banner (e.g., to confirm auto-registration succeeded or to grab the pubkey if it didn't): `docker logs semgrep-network-broker`.
+
+`SCM_TYPE` accepts `github`, `gitlab`, `bitbucket`, or `azuredevops`. **Pass only the host base URL** (e.g., `https://gitlab.example.com`) — the bootstrap appends the right API path for the chosen SCM:
+
+| `SCM_TYPE`    | Appended to `SCM_BASE_URL` for the SCM block's `baseUrl` |
+| ------------- | -------------------------------------------------------- |
+| `github`      | `/api/v3`                                                |
+| `gitlab`      | `/api/v4`                                                |
+| `bitbucket`   | `/rest/api/latest`                                       |
+| `azuredevops` | _(none — pass the full URL including any org/namespace)_ |
+
+`SCM_ALLOW_CODE_ACCESS` is required and must be `true` or `false`. It controls whether the broker is permitted to proxy source-code-fetching endpoints from your SCM. Set `true` for Semgrep features that need to read code (e.g. scans, PR comments on code); set `false` to restrict the broker to metadata-only access. There is no default — you must choose explicitly.
+
+The generated config allows any path under your SCM host for GET/POST/PUT/PATCH/DELETE, which is the typical configuration. If you'd like the broker to be scoped to specific URL patterns instead — or if you need to proxy **more than one SCM** through this broker — set `SCM_CONFIG_FILE` to layer a custom broker config snippet on top (see below).
+
+#### Layering custom config via `SCM_CONFIG_FILE` (also: proxying multiple SCMs)
+
+`SCM_CONFIG_FILE` points at a broker config YAML snippet (a partial `Config`, same schema documented in the [Configuration](#configuration) section). Bootstrap mounts it onto the broker's config stack via a second `-c` flag at exec time, so it overlays on top of the bootstrap-generated config (maps merge, arrays replace — same behavior as passing multiple `-c` flags directly). It supports two scenarios:
+
+1. **Tighten or extend a single-SCM bootstrap.** Set `SCM_TYPE`/`SCM_BASE_URL`/`SCM_ALLOW_CODE_ACCESS` as normal, plus `SCM_CONFIG_FILE`. The bootstrap writes the per-SCM config block + broad allowlist; your file overlays additional settings on top (e.g., replace the allowlist, tweak logging, add a heartbeat URL).
+2. **Multi-SCM (one broker for multiple SCMs).** Set `SCM_CONFIG_FILE` and leave `SCM_TYPE`/`SCM_BASE_URL`/`SCM_ALLOW_CODE_ACCESS` unset. Bootstrap writes a wireguard-only config; your file supplies the SCM blocks and/or allowlist. The recommended approach is to define multiple `inbound.github:` / `inbound.gitlab:` / etc. blocks — the broker will auto-populate the curated per-SCM allowlist for each (same scaffolding documented in [GitHub](#github), [GitLab](#gitlab), [Bitbucket](#bitbucket), and [Azure DevOps](#azure-devops) above), so you don't need to hand-write URL patterns.
+
+Bind-mount the file from the host so it's readable inside the container:
+
+Single-SCM tightening example (replace the broad-start allowlist with specific patterns):
+
+```yaml
+# /opt/semgrep-broker/broker-config.yaml (on the host)
+inbound:
+  allowlist:
+    - url: "https://gitlab.example.com/api/v4/projects/*"
+      methods: [GET, POST]
+    - url: "https://gitlab.example.com/api/v4/groups/*"
+      methods: [GET]
+```
+
+```bash
+docker run -d --name semgrep-network-broker \
+  --restart=always \
+  --cap-add NET_ADMIN \
+  -v /opt/semgrep-broker/broker-config.yaml:/etc/broker-config.yaml:ro \
+  -e SCM_TYPE=gitlab \
+  -e SCM_BASE_URL=https://gitlab.example.com \
+  -e SCM_ALLOW_CODE_ACCESS=true \
+  -e SCM_CONFIG_FILE=/etc/broker-config.yaml \
+  -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
+  -e SEMGREP_DEPLOYMENT_ID=12345 \
+  ghcr.io/semgrep/semgrep-network-broker:latest
+```
+
+Multi-SCM example (one broker, GitLab + GitHub Enterprise, curated allowlists auto-populated):
+
+```yaml
+# /opt/semgrep-broker/broker-config.yaml (on the host)
+inbound:
+  github:
+    baseUrl: https://github.example.com/api/v3
+    allowCodeAccess: true
+  gitlab:
+    baseUrl: https://gitlab.example.com/api/v4
+    allowCodeAccess: true
+```
+
+```bash
+docker run -d --name semgrep-network-broker \
+  --restart=always \
+  --cap-add NET_ADMIN \
+  -v /opt/semgrep-broker/broker-config.yaml:/etc/broker-config.yaml:ro \
+  -e SCM_CONFIG_FILE=/etc/broker-config.yaml \
+  -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \
+  -e SEMGREP_DEPLOYMENT_ID=12345 \
+  ghcr.io/semgrep/semgrep-network-broker:latest
+```
+
+The file must exist inside the container, be readable by the runtime user, and be non-empty — an empty file is rejected to avoid silently starting the broker with no overlay. Bootstrap validates the file on **every** invocation (not just first boot), so updates to the bind-mounted file take effect on the next `docker restart`. To change settings without restarting the container, you can also pass extra `-c <path>` flags after the image name — they layer on top of bootstrap's auto-injected `-c` flags.
+
+If auto-registration's HTTP call failed (bad token, network blip, etc.), grab the public key from the banner in `docker logs` and register it with Semgrep manually:
+
+```bash
+docker logs semgrep-network-broker
+```
+
+**Notes:**
+
+- **Auto-registration is best-effort.** If the `POST /api/broker/<deployment_id>/config` call fails (bad token, network blip, etc.) the bootstrap logs the HTTP status + response body, falls back to printing the manual-registration banner, and starts the broker anyway. You can complete registration by hand from the banner.
+- **Registration can happen after startup.** The broker starts immediately; heartbeats retry on a 60s interval and fail (`heartbeat.failure` in logs) until the public key is registered with Semgrep. Once registered, the next heartbeat succeeds and the broker logs `Established connectivity with Semgrep` — no restart needed.
+- **Config lifetime = container lifetime.** Bootstrap writes `config.yaml` into the container's writable layer (default: `/var/lib/semgrep-network-broker/config.yaml`), not a mounted volume. `docker restart` / host reboots with `--restart=always` / crash-restarts all reuse the same keypair — registration stays valid and `SEMGREP_APP_TOKEN` isn't needed on those restarts. A fresh `docker run` (after `docker rm` or with a new container name) generates a new keypair and re-registers automatically. To rotate keys deliberately, `docker rm` the container and `docker run` again.
+- The bootstrap script only runs when `SCM_TYPE` or `SCM_CONFIG_FILE` is set, so `genkey`, `pubkey`, `relay`, `dump`, and ordinary `-c ... -d ...` invocations continue to work unchanged.
+- `SEMGREP_HOSTNAME` overrides the API host (default `semgrep.dev`) if you need to point at a non-default Semgrep environment.
+
+#### Full reference: all bootstrap env vars
+
+<details>
+<summary>Click to expand — annotated <code>docker run</code> with every env var bootstrap recognizes.</summary>
+
+> The trailing `#` comments are for reading only; shell `\` continuations don't preserve them. Strip the comments before running, or use the clean copy-pastable example in the main bootstrap section above.
+
+```bash
+docker run -d --name semgrep-network-broker \
+    --restart=always \                                                 # recommended  — broker auto-restarts across host reboots
+    --cap-add NET_ADMIN \                                              # REQUIRED     — WireGuard needs NET_ADMIN
+    -e SCM_TYPE=gitlab \                                               # REQUIRED*    — github | gitlab | bitbucket | azuredevops (omit in multi-SCM mode)
+    -e SCM_BASE_URL=https://gitlab.example.com \                       # REQUIRED*    — host base URL only (no API path; bootstrap appends it)
+    -e SCM_ALLOW_CODE_ACCESS=true \                                    # REQUIRED*    — true | false; whether to proxy code-fetching endpoints
+    -e SEMGREP_APP_TOKEN=$SEMGREP_APP_TOKEN \                          # REQUIRED     — used to auto-register the pubkey on each fresh `docker run`
+    -e SEMGREP_DEPLOYMENT_ID=12345 \                                   # REQUIRED     — your Semgrep deployment id (or pass -d <id> after the image name)
+    -e SCM_CONFIG_FILE=/etc/broker-config.yaml \                       # optional**   — broker config snippet layered as a second -c at exec time; bind-mount from the host
+    -e SEMGREP_HOSTNAME=semgrep.dev \                                  # optional     — override Semgrep API host (default: semgrep.dev)
+    -e CONFIG_DIR=/var/lib/semgrep-network-broker \                    # optional     — where bootstrap writes config.yaml (default)
+    ghcr.io/semgrep/semgrep-network-broker:latest
+
+# Auto-injected by bootstrap when it execs the broker:
+#   -c ${CONFIG_DIR}/config.yaml          (the bootstrap-generated config)
+#   -c ${SCM_CONFIG_FILE}                 (if SCM_CONFIG_FILE is set)
+#   -d ${SEMGREP_DEPLOYMENT_ID}           (skipped if -d is already passed on the CLI)
+# Pass additional `-c <overlay.yaml>` flags after the image name to layer further configs on top.
+```
+
+`*` SCM_TYPE / SCM_BASE_URL / SCM_ALLOW_CODE_ACCESS are required for single-SCM bootstrap. **In multi-SCM mode** (one broker proxying multiple SCMs), omit all three and use `SCM_CONFIG_FILE` instead — it becomes the trigger, and your file supplies the `inbound.github:` / `inbound.gitlab:` / etc. blocks the broker needs.
+
+`**` SCM_CONFIG_FILE is optional in single-SCM mode (layered overrides on top of the auto-generated scaffold) and **required** in multi-SCM mode (it's what tells bootstrap to run at all when SCM_TYPE is absent).
+
+Required-on-first-boot only: `SEMGREP_APP_TOKEN`, `SCM_TYPE`, `SCM_BASE_URL`, and `SCM_ALLOW_CODE_ACCESS` are only consumed when bootstrap is generating a new `config.yaml` — i.e., on a fresh `docker run`. `docker restart` and host reboots reuse the existing config and don't need these vars to match. `SEMGREP_DEPLOYMENT_ID` (or `-d` on the CLI) and `SCM_CONFIG_FILE` are read on **every** invocation, since the deployment id is needed by the broker on every start and the config-file overlay is layered at exec time.
+
+</details>
 
 ## Other Commands
 

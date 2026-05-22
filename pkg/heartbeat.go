@@ -15,7 +15,8 @@ var lastSuccessfulHeartbeat time.Time
 func (config *HeartbeatConfig) Start(tnet *netstack.Net, userAgent string) (func(), error) {
 	ticker := time.NewTicker(time.Duration(config.IntervalSeconds) * time.Second)
 	done := make(chan bool)
-	failures := -1
+	failures := 0
+	isFirstAttempt := true
 
 	httpClient := http.Client{
 		Transport: &http.Transport{
@@ -39,23 +40,30 @@ func (config *HeartbeatConfig) Start(tnet *netstack.Net, userAgent string) (func
 			if config.PanicAfterFailureCount > 0 && failures >= config.PanicAfterFailureCount {
 				log.Panicf("Heartbeat failed %v times in a row", failures)
 			}
-			if err != nil {
+			// First attempt often races WireGuard handshake; stay quiet unless
+			// FirstHeartbeatMustSucceed is set (caller will surface the error).
+			if isFirstAttempt && !config.FirstHeartbeatMustSucceed {
+				log.Debug("heartbeat.failure (first attempt)")
+			} else if err != nil {
 				log.WithField("failure_count", failures).WithError(err).Warn("heartbeat.failure")
 			} else {
 				log.WithField("failure_count", failures).WithField("status_code", resp.StatusCode).Warn("heartbeat.failure")
 			}
 			heartbeatFailureCounter.Inc()
+			isFirstAttempt = false
 			return false
 		} else {
-			if failures != 0 {
+			if !hasSeenSuccessfulHeartbeat || failures > 0 {
 				log.WithField("message", "Established connectivity with Semgrep").Info("heartbeat.success")
+			} else {
+				log.Debug("heartbeat.success")
 			}
-			log.Debug("heartbeat.success")
 			failures = 0
 			heartbeatSuccessCounter.Inc()
 			heartbeatLastSuccessTimestamp.SetToCurrentTime()
 			hasSeenSuccessfulHeartbeat = true
 			lastSuccessfulHeartbeat = time.Now()
+			isFirstAttempt = false
 			return true
 		}
 	}
