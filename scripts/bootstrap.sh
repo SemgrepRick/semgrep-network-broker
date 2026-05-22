@@ -220,7 +220,7 @@ YAML
   Public key:     ${PUBLIC_KEY}
   Config:         ${CONFIG_FILE}
 
-  No further action needed. Within ~60s logs should show
+  No further action needed. Within ~30s logs should show
   'Established connectivity with Semgrep'.
 
   Config persists across 'docker restart' / host reboots for this container.
